@@ -1,0 +1,11 @@
+{
+  "replicas": [
+    {"id": "a", "weight": 1, "datacenter": "A", "online": true},
+    {"id": "b", "weight": 1, "datacenter": "A", "online": true},
+    {"id": "c", "weight": 1, "datacenter": "A", "online": false},
+    {"id": "d", "weight": 1, "datacenter": "A", "online": false}
+  ],
+  "read": {"weight_threshold": 3, "required_datacenters": []},
+  "write": {"weight_threshold": 1, "required_datacenters": []},
+  "recovery_plan": true
+}

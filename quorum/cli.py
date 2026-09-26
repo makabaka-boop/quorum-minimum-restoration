@@ -10,8 +10,8 @@ from typing import Any
 from .analyzer import ValidationError, analyze
 
 
-def run_analyzer(payload: Any) -> dict[str, Any]:
-    return analyze(payload)
+def run_analyzer(payload: Any, *, recovery_plan: bool = False) -> dict[str, Any]:
+    return analyze(payload, recovery_plan=recovery_plan)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
         default=2,
         help="spaces used to pretty-print JSON output (default: 2)",
     )
+    parser.add_argument(
+        "--recovery-plan",
+        action="store_true",
+        help="also plan the smallest safe set of offline replicas to restore",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -38,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             with open(args.input, "r", encoding="utf-8") as source:
                 payload = json.load(source)
-        result = run_analyzer(payload)
+        result = run_analyzer(payload, recovery_plan=args.recovery_plan)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
