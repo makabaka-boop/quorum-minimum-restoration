@@ -2,11 +2,16 @@
 
 副本数最多为 12，因此直接枚举 4096 个集合掩码。权重门槛与机房覆盖是
 两个不同维度：仅凭读、写权重阈值之和不能推断两侧仲裁集必相交。
+
+输入带 ``"recovery": true`` 时追加恢复规划：只把当前离线副本作为候选，
+枚举恢复子集并逐一重新裁决，找出恢复数量最少且恢复后读写仲裁仍两两
+相交的集合。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any, Mapping
 
 
@@ -178,15 +183,36 @@ def _witness(mask: int, replica_ids: list[str]) -> dict[str, list[str]]:
     return {"replica_ids": _mask_to_ids(mask, replica_ids)}
 
 
-def analyze(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """分析输入并返回稳定的 JSON 兼容结果。"""
-    if not isinstance(payload, Mapping):
-        raise ValidationError("request body must be a JSON object")
+def _check_required_datacenters(
+    replicas: list[_Replica],
+    read: _Side,
+    write: _Side,
+) -> None:
+    known = {replica.datacenter for replica in replicas}
+    for name, side in (("read", read), ("write", write)):
+        for datacenter in side.required_datacenters:
+            if datacenter not in known:
+                raise ValidationError(
+                    f"{name}.required_datacenters references unknown datacenter: "
+                    f"{datacenter}"
+                )
 
-    replicas = _parse_replicas(payload.get("replicas"))
-    read = _side(payload.get("read", {}), "read")
-    write = _side(payload.get("write", {}), "write")
-    datacenter_masks = _required_masks(replicas)
+
+def _parse_recovery(value: Any) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValidationError("recovery must be a boolean")
+    return value
+
+
+def _evaluate(
+    replicas: list[_Replica],
+    read: _Side,
+    write: _Side,
+    datacenter_masks: Mapping[str, int],
+) -> dict[str, Any]:
+    """对一种副本在线状态枚举仲裁集并裁决交集安全性。"""
     replica_ids = [replica.replica_id for replica in replicas]
 
     read_masks = _feasible_masks(replicas, read, datacenter_masks)
@@ -271,4 +297,114 @@ def analyze(payload: Mapping[str, Any]) -> dict[str, Any]:
         "write": _witness(disjoint_write, replica_ids),
     }
 
+    return result
+
+
+def _restore_replicas(
+    replicas: list[_Replica],
+    restored: set[int],
+) -> list[_Replica]:
+    """把指定下标的副本标记为在线，权重、机房等属性保持不变。"""
+    return [
+        _Replica(
+            replica_id=replica.replica_id,
+            weight=replica.weight,
+            datacenter=replica.datacenter,
+            online=replica.online or index in restored,
+        )
+        for index, replica in enumerate(replicas)
+    ]
+
+
+def _recovery_view(evaluated: Mapping[str, Any]) -> dict[str, Any]:
+    """从一次裁决结果中截取恢复规划需要报告的字段。"""
+    return {
+        "read_possible": evaluated["read_possible"],
+        "write_possible": evaluated["write_possible"],
+        "minimum_intersection": evaluated["minimum_intersection"],
+        "witness_read": evaluated["witness_read"],
+        "witness_write": evaluated["witness_write"],
+    }
+
+
+def _plan_recovery(
+    replicas: list[_Replica],
+    read: _Side,
+    write: _Side,
+    datacenter_masks: Mapping[str, int],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    """枚举离线副本的恢复子集，找出恢复数量最少的安全集合。
+
+    安全指恢复后读、写两侧均可行且最小交集大于 0；仅两侧各自可行不算
+    安全。交集安全性关于恢复集合不是单调的：多恢复副本可能启用新的
+    不相交仲裁对，因此每个候选集合都按原权重、机房和在线语义独立重新
+    裁决，按集合大小递增枚举，并列时取副本 id 列表字典序最小者。
+    """
+    if current["safe"]:
+        return {
+            "already_safe": True,
+            "reachable": True,
+            "restore": [],
+            **_recovery_view(current),
+        }
+
+    offline_indices = [
+        index for index, replica in enumerate(replicas) if not replica.online
+    ]
+
+    for size in range(1, len(offline_indices) + 1):
+        best_ids: list[str] | None = None
+        best_evaluated: dict[str, Any] | None = None
+        for combo in combinations(offline_indices, size):
+            evaluated = _evaluate(
+                _restore_replicas(replicas, set(combo)),
+                read,
+                write,
+                datacenter_masks,
+            )
+            if not evaluated["safe"]:
+                continue
+            # 副本已按 id 排序，组合内下标递增即 id 列表字典序。
+            ids = [replicas[index].replica_id for index in combo]
+            if best_ids is None or ids < best_ids:
+                best_ids = ids
+                best_evaluated = evaluated
+        if best_ids is not None and best_evaluated is not None:
+            return {
+                "already_safe": False,
+                "reachable": True,
+                "restore": best_ids,
+                **_recovery_view(best_evaluated),
+            }
+
+    return {
+        "already_safe": False,
+        "reachable": False,
+        "restore": None,
+        "read_possible": None,
+        "write_possible": None,
+        "minimum_intersection": None,
+        "witness_read": None,
+        "witness_write": None,
+    }
+
+
+def analyze(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """分析输入并返回稳定的 JSON 兼容结果。"""
+    if not isinstance(payload, Mapping):
+        raise ValidationError("request body must be a JSON object")
+
+    replicas = _parse_replicas(payload.get("replicas"))
+    read = _side(payload.get("read", {}), "read")
+    write = _side(payload.get("write", {}), "write")
+    _check_required_datacenters(replicas, read, write)
+    recovery = _parse_recovery(payload.get("recovery"))
+
+    datacenter_masks = _required_masks(replicas)
+    result = _evaluate(replicas, read, write, datacenter_masks)
+    if recovery:
+        result["recovery_plan"] = _plan_recovery(
+            replicas, read, write, datacenter_masks, result
+        )
     return result

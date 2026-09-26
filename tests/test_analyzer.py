@@ -4,6 +4,8 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from copy import deepcopy
+from itertools import combinations
 from pathlib import Path
 
 import pytest
@@ -126,6 +128,74 @@ def expected_analysis(payload):
             "write": {"replica_ids": ids_for(write_mask, replicas)},
         }
     return expected
+
+
+def restored_payload(payload, positions):
+    """返回把指定下标副本标记为在线后的新 payload。"""
+    restored = deepcopy(payload)
+    for position in positions:
+        restored["replicas"][position]["online"] = True
+    return restored
+
+
+def expected_recovery_plan(payload):
+    """独立枚举离线副本子集，重放 expected_analysis 得到恢复规划。"""
+    current = expected_analysis(payload)
+
+    def view(evaluated):
+        return {
+            "read_possible": evaluated["read_possible"],
+            "write_possible": evaluated["write_possible"],
+            "minimum_intersection": evaluated["minimum_intersection"],
+            "witness_read": evaluated["witness_read"],
+            "witness_write": evaluated["witness_write"],
+        }
+
+    if current["safe"]:
+        return {
+            "already_safe": True,
+            "reachable": True,
+            "restore": [],
+            **view(current),
+        }
+
+    offline = [
+        index
+        for index, item in enumerate(payload["replicas"])
+        if not item["online"]
+    ]
+    for size in range(1, len(offline) + 1):
+        best = None
+        for combo in combinations(offline, size):
+            evaluated = expected_analysis(restored_payload(payload, combo))
+            if not evaluated["safe"]:
+                continue
+            ids = sorted(payload["replicas"][index]["id"] for index in combo)
+            if best is None or ids < best[0]:
+                best = (ids, evaluated)
+        if best is not None:
+            ids, evaluated = best
+            return {
+                "already_safe": False,
+                "reachable": True,
+                "restore": ids,
+                **view(evaluated),
+            }
+
+    return {
+        "already_safe": False,
+        "reachable": False,
+        "restore": None,
+        "read_possible": None,
+        "write_possible": None,
+        "minimum_intersection": None,
+        "witness_read": None,
+        "witness_write": None,
+    }
+
+
+def analyze_with_recovery(payload):
+    return analyze({**payload, "recovery": True})
 
 
 def test_weight_threshold_alone_misses_region_induced_disjoint_pair():
@@ -340,6 +410,219 @@ def test_random_small_instances_match_bitmask_enumeration(seed):
     assert analyze(payload) == expected_analysis(payload)
 
 
+def test_recovery_plan_restores_cross_datacenter_quorum():
+    payload = make_payload(
+        [
+            replica("a1", 6, "A"),
+            replica("a2", 6, "A"),
+            replica("b1", 6, "B", online=False),
+        ],
+        read_threshold=12,
+        write_threshold=12,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+    result = analyze_with_recovery(payload)
+
+    # 当前 B 机房没有在线副本，两侧都不可行；恢复 b1 后跨机房仲裁成立。
+    assert result["read_possible"] is False
+    assert result["write_possible"] is False
+    plan = result["recovery_plan"]
+    assert plan["already_safe"] is False
+    assert plan["reachable"] is True
+    assert plan["restore"] == ["b1"]
+    assert plan["read_possible"] is True
+    assert plan["write_possible"] is True
+    assert plan["minimum_intersection"] == 1
+    assert plan["witness_read"] == {"replica_ids": ["a1", "b1"]}
+    assert plan["witness_write"] == {"replica_ids": ["a2", "b1"]}
+    assert plan == expected_recovery_plan(payload)
+
+
+def test_recovery_plan_empty_quorum_side_is_never_safe():
+    payload = make_payload(
+        [replica("a", 3, "A"), replica("b", 3, "B", online=False)],
+        read_threshold=0,
+        write_threshold=3,
+    )
+
+    result = analyze_with_recovery(payload)
+
+    # 读侧阈值为 0，空仲裁集永远可行且与任何写仲裁集不相交；
+    # 两侧各自可行不等于安全，恢复任何副本都无法达到安全。
+    assert result["read_possible"] is True
+    assert result["write_possible"] is True
+    assert result["safe"] is False
+    plan = result["recovery_plan"]
+    assert plan["already_safe"] is False
+    assert plan["reachable"] is False
+    assert plan["restore"] is None
+    assert plan["minimum_intersection"] is None
+    assert plan["witness_read"] is None
+    assert plan["witness_write"] is None
+    assert plan == expected_recovery_plan(payload)
+
+
+def test_recovery_plan_tie_prefers_lexicographically_smallest_ids():
+    payload = make_payload(
+        [
+            replica("r1", 5, "A"),
+            replica("r2", 5, "A", online=False),
+            replica("r3", 5, "A", online=False),
+        ],
+        read_threshold=10,
+        write_threshold=10,
+    )
+
+    plan = analyze_with_recovery(payload)["recovery_plan"]
+
+    # 恢复 r2 或 r3 都各自形成唯一仲裁对，并列时取 id 列表字典序最小者。
+    assert plan["reachable"] is True
+    assert plan["restore"] == ["r2"]
+    assert plan["minimum_intersection"] == 2
+    assert plan["witness_read"] == {"replica_ids": ["r1", "r2"]}
+    assert plan["witness_write"] == {"replica_ids": ["r1", "r2"]}
+    assert plan == expected_recovery_plan(payload)
+
+
+def test_recovery_plan_does_not_assume_more_replicas_stay_safe():
+    payload = make_payload(
+        [
+            replica("a1", 5, "A"),
+            replica("a2", 5, "A", online=False),
+            replica("b1", 5, "B", online=False),
+        ],
+        read_threshold=10,
+        write_threshold=5,
+        write_dcs=["B"],
+    )
+
+    plan = analyze_with_recovery(payload)["recovery_plan"]
+
+    # 只恢复 b1 即可让读、写仲裁都经过 b1，交集为 1。
+    assert plan["reachable"] is True
+    assert plan["restore"] == ["b1"]
+    assert plan["minimum_intersection"] == 1
+    assert plan["witness_read"] == {"replica_ids": ["a1", "b1"]}
+    assert plan["witness_write"] == {"replica_ids": ["b1"]}
+
+    # 多恢复 a2 反而启用不相交对 {a1,a2} 与 {b1}：恢复更多并不必然改善交集。
+    fully_restored = analyze(restored_payload(payload, [1, 2]))
+    assert fully_restored["read_possible"] is True
+    assert fully_restored["write_possible"] is True
+    assert fully_restored["minimum_intersection"] == 0
+    assert fully_restored["safe"] is False
+    assert plan == expected_recovery_plan(payload)
+
+
+def test_recovery_plan_already_safe_returns_empty_set():
+    payload = make_payload(
+        [replica("a"), replica("b"), replica("c")],
+        read_threshold=2,
+        write_threshold=2,
+    )
+
+    result = analyze_with_recovery(payload)
+    plan = result["recovery_plan"]
+
+    assert result["safe"] is True
+    assert plan["already_safe"] is True
+    assert plan["reachable"] is True
+    assert plan["restore"] == []
+    assert plan["minimum_intersection"] == result["minimum_intersection"] == 1
+    assert plan["witness_read"] == result["witness_read"]
+    assert plan["witness_write"] == result["witness_write"]
+    assert plan == expected_recovery_plan(payload)
+
+
+def test_recovery_plan_unreachable_when_nothing_left_to_restore():
+    payload = make_payload(
+        [
+            replica("a1", 6, "A"),
+            replica("a2", 6, "A"),
+            replica("b1", 6, "B"),
+            replica("b2", 6, "B"),
+        ],
+        read_threshold=12,
+        write_threshold=12,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+    result = analyze_with_recovery(payload)
+    plan = result["recovery_plan"]
+
+    assert result["minimum_intersection"] == 0
+    assert plan["already_safe"] is False
+    assert plan["reachable"] is False
+    assert plan["restore"] is None
+    assert plan == expected_recovery_plan(payload)
+
+
+def random_planning_payload(seed):
+    rng = __import__("random").Random(seed)
+    n = rng.randint(2, 7)
+    ids = [f"p{index:02d}-{rng.randrange(36):x}" for index in range(n)]
+    assert len(set(ids)) == n
+    datacenters = [rng.choice(["dc-a", "dc-b"]) for _ in range(n)]
+    replicas = [
+        replica(
+            identifier,
+            weight=rng.randint(1, 9),
+            dc=datacenter,
+            online=rng.random() >= 0.35,
+        )
+        for identifier, datacenter in zip(ids, datacenters)
+    ]
+
+    def side():
+        dc_options = sorted(set(datacenters))
+        required = rng.sample(dc_options, rng.randrange(len(dc_options) + 1))
+        return {
+            "weight_threshold": rng.randrange(0, 25),
+            "required_datacenters": required,
+        }
+
+    return {"replicas": replicas, "read": side(), "write": side()}
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_random_recovery_plans_match_subset_enumeration(seed):
+    payload = random_planning_payload(seed)
+    result = analyze_with_recovery(payload)
+    assert result == {
+        **expected_analysis(payload),
+        "recovery_plan": expected_recovery_plan(payload),
+    }
+
+
+def test_recovery_disabled_keeps_response_unchanged():
+    payload = make_payload(
+        [replica("a", 9), replica("b", 9)],
+        read_threshold=9,
+        write_threshold=9,
+    )
+
+    assert analyze(payload) == expected_analysis(payload)
+    assert "recovery_plan" not in analyze(payload)
+    assert analyze({**payload, "recovery": False}) == expected_analysis(payload)
+
+
+@pytest.mark.parametrize("recovery", ["yes", 1, 0, {}, [], {"enabled": True}])
+def test_recovery_flag_must_be_boolean(recovery):
+    payload = make_payload([replica("a"), replica("b")])
+    payload["recovery"] = recovery
+    with pytest.raises(ValidationError, match="recovery must be a boolean"):
+        analyze(payload)
+
+
+def test_invalid_input_with_recovery_raises_before_planning():
+    payload = {"replicas": [], "recovery": True}
+    with pytest.raises(ValidationError, match="between 2 and 12"):
+        analyze(payload)
+
+
 @pytest.mark.parametrize(
     "bad_payload,message",
     [
@@ -415,6 +698,103 @@ def test_http_service_accepts_json_and_reports_validation_errors():
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(bad_request, timeout=5)
         assert exc_info.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def recovery_payload():
+    return make_payload(
+        [
+            replica("a1", 6, "A"),
+            replica("a2", 6, "A"),
+            replica("b1", 6, "B", online=False),
+        ],
+        read_threshold=12,
+        write_threshold=12,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+
+def test_cli_recovery_planning_enabled_via_payload():
+    payload = {**recovery_payload(), "recovery": True}
+    completed = subprocess.run(
+        [sys.executable, "-m", "quorum"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=ROOT,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) == {
+        **expected_analysis(payload),
+        "recovery_plan": expected_recovery_plan(payload),
+    }
+
+
+def test_cli_invalid_recovery_flag_exits_with_error():
+    payload = {**recovery_payload(), "recovery": "yes"}
+    completed = subprocess.run(
+        [sys.executable, "-m", "quorum"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=ROOT,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "recovery must be a boolean" in completed.stderr
+    assert completed.stdout == ""
+
+
+def test_http_recovery_planning_enabled_via_payload():
+    server = build_server("127.0.0.1", 0)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        payload = {**recovery_payload(), "recovery": True}
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/analyze",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+            assert json.loads(response.read()) == {
+                **expected_analysis(payload),
+                "recovery_plan": expected_recovery_plan(payload),
+            }
+
+        # 未启用规划时响应保持原样，不含 recovery_plan。
+        plain_request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/analyze",
+            data=json.dumps(recovery_payload()).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(plain_request, timeout=5) as response:
+            assert response.status == 200
+            assert json.loads(response.read()) == expected_analysis(
+                recovery_payload()
+            )
+
+        bad_request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/analyze",
+            data=json.dumps({**recovery_payload(), "recovery": 1}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(bad_request, timeout=5)
+        assert exc_info.value.code == 400
+        assert b"recovery must be a boolean" in exc_info.value.read()
     finally:
         server.shutdown()
         server.server_close()
